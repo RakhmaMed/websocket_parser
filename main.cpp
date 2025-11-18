@@ -1,3 +1,4 @@
+#define NOMINMAX
 #include <fmt/core.h>
 #include <fmt/chrono.h>
 #include <pcapplusplus/PcapFileDevice.h>
@@ -26,7 +27,7 @@ struct TcpSessionData
     std::string fileName;
     uint32_t flowKey;
     bool isActive;
-    std::vector<uint8_t> buffer;  // Буфер для накопления данных
+    std::vector<uint8_t> buffer[2];  // Буферы для двух направлений (0 и 1)
     timeval lastPacketTime;  // Время последнего пакета
     
     TcpSessionData() : flowKey(0), isActive(false) 
@@ -55,11 +56,26 @@ struct WebSocketFrame
     timeval timestamp;  // Время фрейма из pcap
 };
 
+// Вспомогательная функция для Hex дампа
+std::string hexDump(const uint8_t* data, size_t size, size_t limit = 32)
+{
+    std::ostringstream oss;
+    for (size_t i = 0; i < (std::min)(size, limit); ++i)
+    {
+        oss << fmt::format("{:02X} ", data[i]);
+    }
+    if (size > limit) oss << "...";
+    return oss.str();
+}
+
 // Парсинг WebSocket фрейма
-bool parseWebSocketFrame(const uint8_t* data, size_t dataLen, size_t& offset, WebSocketFrame& frame)
+bool parseWebSocketFrame(const uint8_t* data, size_t dataLen, size_t& offset, WebSocketFrame& frame, std::string& errorLog)
 {
     if (offset >= dataLen)
         return false;
+    
+    // Сохраняем начальный offset для отладки
+    size_t startOffset = offset;
     
     // Минимальный размер фрейма - 2 байта
     if (dataLen - offset < 2)
@@ -170,56 +186,59 @@ std::string formatTimestamp(const timeval& tv)
 }
 
 // Обработка WebSocket данных для сессии
-void processWebSocketData(TcpSessionData& sessionData, const uint8_t* data, size_t dataLen, const timeval& packetTime)
+void processWebSocketData(TcpSessionData& sessionData, int8_t side, const uint8_t* data, size_t dataLen, const timeval& packetTime)
 {
     // Обновляем время последнего пакета
     sessionData.lastPacketTime = packetTime;
     
+    auto& buffer = sessionData.buffer[side];
+
     // Проверка на переполнение буфера
-    if (sessionData.buffer.size() + dataLen > MAX_SESSION_BUFFER_SIZE)
+    if (buffer.size() + dataLen > MAX_SESSION_BUFFER_SIZE)
     {
-        std::string errorInfo = fmt::format("\n[ERROR: Session buffer exceeded limit ({} bytes). Dropping connection data to prevent memory overflow]\n", MAX_SESSION_BUFFER_SIZE);
+        std::string errorInfo = fmt::format("\n[ERROR: Session buffer (side {}) exceeded limit ({} bytes). Dropping connection data to prevent memory overflow]\n", side, MAX_SESSION_BUFFER_SIZE);
         if (sessionData.outputFile.is_open())
         {
             sessionData.outputFile.write(errorInfo.c_str(), errorInfo.length());
             sessionData.outputFile.flush();
         }
-        // Очищаем буфер, чтобы не копить старые данные, раз мы уже потеряли синхронизацию/поток
-        sessionData.buffer.clear();
+        // Очищаем буфер, чтобы не копить старые данные
+        buffer.clear();
         return;
     }
 
     // Добавляем данные в буфер
     if (dataLen > 0)
     {
-        size_t oldSize = sessionData.buffer.size();
-        sessionData.buffer.resize(oldSize + dataLen);
-        std::memcpy(sessionData.buffer.data() + oldSize, data, dataLen);
+        size_t oldSize = buffer.size();
+        buffer.resize(oldSize + dataLen);
+        std::memcpy(buffer.data() + oldSize, data, dataLen);
     }
     
     // Парсим фреймы из буфера
     size_t processedBytes = 0;
-    size_t bufferSizeBefore = sessionData.buffer.size();
+    size_t bufferSizeBefore = buffer.size();
     
-    while (processedBytes < sessionData.buffer.size())
+    while (processedBytes < buffer.size())
     {
         WebSocketFrame frame;
         size_t offset = processedBytes;
-        size_t bytesAvailable = sessionData.buffer.size() - offset;
+        size_t bytesAvailable = buffer.size() - offset;
+        std::string errorLog; // Для сбора информации об ошибке
         
-        if (!parseWebSocketFrame(sessionData.buffer.data(), sessionData.buffer.size(), offset, frame))
+        if (!parseWebSocketFrame(buffer.data(), buffer.size(), offset, frame, errorLog))
         {
             // Недостаточно данных для полного фрейма, оставляем в буфере
             // Логируем, если фрейм очень большой (возможна проблема)
             if (bytesAvailable >= 2)
             {
-                uint8_t byte0 = sessionData.buffer[offset];
-                uint8_t byte1 = sessionData.buffer[offset + 1];
+                uint8_t byte0 = buffer[offset];
+                uint8_t byte1 = buffer[offset + 1];
                 uint8_t payloadLenField = byte1 & 0x7F;
                 
                 // Если мы видим начало фрейма, но не можем его распарсить,
                 // возможно, фрейм очень большой и приходит частями
-                if (payloadLenField == 127 && bytesAvailable < 15) // 2 (заголовок) + 8 (длина) + 4 (маска) + 1 (минимальный payload)
+                if (payloadLenField == 127 && bytesAvailable < 15) 
                 {
                     // Это нормально - большой фрейм приходит частями, ждем
                 }
@@ -235,21 +254,51 @@ void processWebSocketData(TcpSessionData& sessionData, const uint8_t* data, size
         frame.timestamp = packetTime;
         
         // Проверяем валидность опкода WebSocket
-        // Валидные опкоды: 0 (Continuation), 1 (Text), 2 (Binary), 8 (Close), 9 (Ping), 10 (Pong)
         bool validOpcode = (frame.opcode == 0 || frame.opcode == 1 || frame.opcode == 2 || 
                            frame.opcode == 8 || frame.opcode == 9 || frame.opcode == 10);
         if (!validOpcode)
         {
-            std::string errorInfo = fmt::format("\n[ERROR: Reserved WebSocket opcode {} detected at offset {} (frame start: {}) - parser desynchronized, stopping frame parsing]\n", 
-                frame.opcode, frameStartOffset, frameStartOffset);
+            // Генерируем Hex дамп вокруг места ошибки
+            size_t dumpStart = (frameStartOffset > 32) ? frameStartOffset - 32 : 0;
+            std::string contextDump = hexDump(buffer.data() + dumpStart, 64);
+            
+            std::string errorInfo = fmt::format("\n[ERROR: Reserved WebSocket opcode {} detected at offset {} (frame start: {}) in side {}]\n", 
+                frame.opcode, frameStartOffset, frameStartOffset, side);
+            errorInfo += fmt::format("Context Hex Dump (around offset {}): {}\n", frameStartOffset, contextDump);
+            errorInfo += fmt::format("Buffer Size: {}, Payload Length: {}, Masked: {}\n", 
+                buffer.size(), frame.payloadLength, frame.masked);
+                
             if (sessionData.outputFile.is_open())
             {
                 sessionData.outputFile.write(errorInfo.c_str(), errorInfo.length());
                 sessionData.outputFile.flush();
             }
             
-            processedBytes = frameStartOffset;
-            break;
+            // Попытка найти следующий валидный фрейм (brute-force sync)
+            // Ищем байт, похожий на начало фрейма (например, 0x81 - Text, FIN)
+            // Это примитивный эвристический поиск
+            size_t searchOffset = frameStartOffset + 1;
+            bool found = false;
+            while (searchOffset < buffer.size() - 2) {
+                uint8_t b0 = buffer[searchOffset];
+                uint8_t opcode = b0 & 0x0F;
+                if ((b0 & 0x80) && (opcode == 1 || opcode == 2 || opcode == 8)) {
+                    // Нашли кандидата
+                    found = true;
+                    processedBytes = searchOffset;
+                    std::string recoverMsg = fmt::format("[RECOVERY] Found potential frame start at offset {}. Skipping {} bytes.\n", searchOffset, searchOffset - frameStartOffset);
+                    if (sessionData.outputFile.is_open()) sessionData.outputFile.write(recoverMsg.c_str(), recoverMsg.length());
+                    break;
+                }
+                searchOffset++;
+            }
+            
+            if (!found) {
+                // Если не нашли, сбрасываем буфер, чтобы не зацикливаться
+                processedBytes = buffer.size(); 
+            }
+            // Мы либо нашли новый старт (continue loop), либо сбросили буфер (break next iteration)
+            continue; 
         }
         
         // Проверка на разумность размера фрейма для предотвращения парсинга мусора
@@ -271,7 +320,7 @@ void processWebSocketData(TcpSessionData& sessionData, const uint8_t* data, size
         if (frame.payloadLength > 0 && sessionData.outputFile.is_open())
         {
             // Записываем информацию о фрейме с временем
-            std::string frameInfo = fmt::format("\n--- WebSocket Frame ---\n");
+            std::string frameInfo = fmt::format("\n--- WebSocket Frame (Side {}) ---\n", side);
             frameInfo += fmt::format("Time: {}\n", formatTimestamp(frame.timestamp));
             frameInfo += fmt::format("FIN: {}, Opcode: {}, Masked: {}, Length: {}\n", 
                 frame.fin, frame.opcode, frame.masked, frame.payloadLength);
@@ -284,10 +333,10 @@ void processWebSocketData(TcpSessionData& sessionData, const uint8_t* data, size
         }
     }
     
-    // Удаляем обработанные данные из буфера (Оптимизация: используем erase вместо создания нового вектора)
+    // Удаляем обработанные данные из буфера
     if (processedBytes > 0)
     {
-        sessionData.buffer.erase(sessionData.buffer.begin(), sessionData.buffer.begin() + processedBytes);
+        buffer.erase(buffer.begin(), buffer.begin() + processedBytes);
     }
 }
 
@@ -330,20 +379,33 @@ void onTcpMessageReady(int8_t side, const TcpStreamData& tcpData, void* userCook
     const uint8_t* data = tcpData.getData();
     size_t dataLen = tcpData.getDataLength();
     
+    // Сначала проверяем на наличие потерянных пакетов (разрывов потока)
+    // TcpReassembly может вызвать этот callback с dataLen=0, чтобы сообщить о разрыве
+    if (tcpData.isBytesMissing())
+    {
+        size_t missingCount = tcpData.getMissingByteCount();
+        
+        // Логируем факт потери
+        if (sessionData.outputFile.is_open())
+        {
+             std::string missingMarker = fmt::format("\n[WARNING: Stream discontinuity detected in side {}. Inserting {} padding bytes to maintain sync]\n", side, missingCount);
+             sessionData.outputFile.write(missingMarker.c_str(), missingMarker.length());
+        }
+        
+        // Добавляем нули в буфер
+        auto& buffer = sessionData.buffer[side];
+        size_t oldSize = buffer.size();
+        buffer.resize(oldSize + missingCount, 0);
+    }
+
+    // Затем обрабатываем данные, если они есть
     if (dataLen > 0)
     {
         // Получаем время пакета из pcap
         timeval packetTime = tcpData.getTimeStamp();
         
         // Обрабатываем как WebSocket данные
-        processWebSocketData(sessionData, data, dataLen, packetTime);
-        
-        // Если есть пропущенные байты, добавляем маркер
-        if (tcpData.isBytesMissing() && sessionData.outputFile.is_open())
-        {
-            std::string missingMarker = fmt::format("\n[{} bytes missing]\n", tcpData.getMissingByteCount());
-            sessionData.outputFile.write(missingMarker.c_str(), missingMarker.length());
-        }
+        processWebSocketData(sessionData, side, data, dataLen, packetTime);
     }
 }
 
@@ -364,18 +426,21 @@ void onTcpConnectionEnd(const ConnectionData& connectionData, TcpReassembly::Con
     
     if (it != ctx->sessionDataMap.end())
     {
-        // Обрабатываем оставшиеся данные в буфере
-        if (!it->second.buffer.empty() && (it->second.lastPacketTime.tv_sec != 0 || it->second.lastPacketTime.tv_usec != 0))
+        // Обрабатываем оставшиеся данные в буферах для обоих направлений
+        for (int side = 0; side < 2; side++)
         {
-            // Используем время последнего пакета для оставшихся данных
-            processWebSocketData(it->second, nullptr, 0, it->second.lastPacketTime); // Вызываем с пустыми данными, чтобы допарсить буфер
-        }
-        
-        // Проверяем, остались ли нераспаршенные данные
-        if (!it->second.buffer.empty() && it->second.outputFile.is_open())
-        {
-             std::string incompleteMsg = fmt::format("\n[WARNING: Connection ended with {} bytes of incomplete frame data in buffer]\n", it->second.buffer.size());
-             it->second.outputFile.write(incompleteMsg.c_str(), incompleteMsg.length());
+            if (!it->second.buffer[side].empty() && (it->second.lastPacketTime.tv_sec != 0 || it->second.lastPacketTime.tv_usec != 0))
+            {
+                // Используем время последнего пакета для оставшихся данных
+                processWebSocketData(it->second, side, nullptr, 0, it->second.lastPacketTime); 
+            }
+            
+            // Проверяем, остались ли нераспаршенные данные
+            if (!it->second.buffer[side].empty() && it->second.outputFile.is_open())
+            {
+                 std::string incompleteMsg = fmt::format("\n[WARNING: Connection ended with {} bytes of incomplete frame data in buffer (side {})]\n", it->second.buffer[side].size(), side);
+                 it->second.outputFile.write(incompleteMsg.c_str(), incompleteMsg.length());
+            }
         }
         
         if (it->second.outputFile.is_open())
