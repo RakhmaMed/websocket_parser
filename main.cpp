@@ -16,6 +16,9 @@
 
 using namespace pcpp;
 
+// Максимальный разумный размер буфера сессии (50 MB) для предотвращения DoS/OOM
+const size_t MAX_SESSION_BUFFER_SIZE = 50 * 1024 * 1024;
+
 // Структура для хранения данных TCP сессии
 struct TcpSessionData
 {
@@ -33,8 +36,12 @@ struct TcpSessionData
     }
 };
 
-// Глобальная карта для хранения данных сессий
-std::map<uint32_t, TcpSessionData> sessionDataMap;
+// Структура контекста приложения для передачи в callback'и
+struct AppContext
+{
+    std::string outputFileName;
+    std::map<uint32_t, TcpSessionData> sessionDataMap;
+};
 
 // Структура для WebSocket фрейма
 struct WebSocketFrame
@@ -163,17 +170,32 @@ std::string formatTimestamp(const timeval& tv)
 }
 
 // Обработка WebSocket данных для сессии
-void processWebSocketData(uint32_t flowKey, const uint8_t* data, size_t dataLen, const timeval& packetTime)
+void processWebSocketData(TcpSessionData& sessionData, const uint8_t* data, size_t dataLen, const timeval& packetTime)
 {
-    auto& sessionData = sessionDataMap[flowKey];
-    
     // Обновляем время последнего пакета
     sessionData.lastPacketTime = packetTime;
     
+    // Проверка на переполнение буфера
+    if (sessionData.buffer.size() + dataLen > MAX_SESSION_BUFFER_SIZE)
+    {
+        std::string errorInfo = fmt::format("\n[ERROR: Session buffer exceeded limit ({} bytes). Dropping connection data to prevent memory overflow]\n", MAX_SESSION_BUFFER_SIZE);
+        if (sessionData.outputFile.is_open())
+        {
+            sessionData.outputFile.write(errorInfo.c_str(), errorInfo.length());
+            sessionData.outputFile.flush();
+        }
+        // Очищаем буфер, чтобы не копить старые данные, раз мы уже потеряли синхронизацию/поток
+        sessionData.buffer.clear();
+        return;
+    }
+
     // Добавляем данные в буфер
-    size_t oldSize = sessionData.buffer.size();
-    sessionData.buffer.resize(oldSize + dataLen);
-    std::memcpy(sessionData.buffer.data() + oldSize, data, dataLen);
+    if (dataLen > 0)
+    {
+        size_t oldSize = sessionData.buffer.size();
+        sessionData.buffer.resize(oldSize + dataLen);
+        std::memcpy(sessionData.buffer.data() + oldSize, data, dataLen);
+    }
     
     // Парсим фреймы из буфера
     size_t processedBytes = 0;
@@ -193,8 +215,6 @@ void processWebSocketData(uint32_t flowKey, const uint8_t* data, size_t dataLen,
             {
                 uint8_t byte0 = sessionData.buffer[offset];
                 uint8_t byte1 = sessionData.buffer[offset + 1];
-                uint8_t opcode = byte0 & 0x0F;
-                bool masked = (byte1 & 0x80) != 0;
                 uint8_t payloadLenField = byte1 & 0x7F;
                 
                 // Если мы видим начало фрейма, но не можем его распарсить,
@@ -216,36 +236,33 @@ void processWebSocketData(uint32_t flowKey, const uint8_t* data, size_t dataLen,
         
         // Проверяем валидность опкода WebSocket
         // Валидные опкоды: 0 (Continuation), 1 (Text), 2 (Binary), 8 (Close), 9 (Ping), 10 (Pong)
-        // 3-7 и 11-15 зарезервированы и не должны встречаться в нормальных фреймах
-        // Если мы видим зарезервированные опкоды, возможно, парсер сбился и интерпретирует
-        // часть payload предыдущего фрейма как начало нового фрейма
         bool validOpcode = (frame.opcode == 0 || frame.opcode == 1 || frame.opcode == 2 || 
                            frame.opcode == 8 || frame.opcode == 9 || frame.opcode == 10);
         if (!validOpcode)
         {
-            // Зарезервированный опкод - возможна ошибка парсинга
-            // Это означает, что мы пытаемся парсить данные из середины предыдущего фрейма
-            // Откатываем offset назад к началу этого "фрейма" и прекращаем парсинг
             std::string errorInfo = fmt::format("\n[ERROR: Reserved WebSocket opcode {} detected at offset {} (frame start: {}) - parser desynchronized, stopping frame parsing]\n", 
                 frame.opcode, frameStartOffset, frameStartOffset);
-            sessionData.outputFile.write(errorInfo.c_str(), errorInfo.length());
-            sessionData.outputFile.flush();
+            if (sessionData.outputFile.is_open())
+            {
+                sessionData.outputFile.write(errorInfo.c_str(), errorInfo.length());
+                sessionData.outputFile.flush();
+            }
             
-            // Откатываем обработанные байты к началу этого фрейма - не удаляем эти данные из буфера
-            // Они могут быть частью незаконченного большого фрейма или поврежденных данных
             processedBytes = frameStartOffset;
             break;
         }
         
         // Проверка на разумность размера фрейма для предотвращения парсинга мусора
-        // Если фрейм слишком большой (например, > 10MB), это может быть ошибка парсинга
         const size_t MAX_REASONABLE_FRAME_SIZE = 10 * 1024 * 1024; // 10 MB
         if (frame.payloadLength > MAX_REASONABLE_FRAME_SIZE)
         {
             std::string errorInfo = fmt::format("\n[ERROR: Frame size {} exceeds maximum reasonable size {} - possible parsing error]\n", 
                 frame.payloadLength, MAX_REASONABLE_FRAME_SIZE);
-            sessionData.outputFile.write(errorInfo.c_str(), errorInfo.length());
-            sessionData.outputFile.flush();
+            if (sessionData.outputFile.is_open())
+            {
+                sessionData.outputFile.write(errorInfo.c_str(), errorInfo.length());
+                sessionData.outputFile.flush();
+            }
             processedBytes = frameStartOffset;
             break;
         }
@@ -267,31 +284,41 @@ void processWebSocketData(uint32_t flowKey, const uint8_t* data, size_t dataLen,
         }
     }
     
-    // Удаляем обработанные данные из буфера
+    // Удаляем обработанные данные из буфера (Оптимизация: используем erase вместо создания нового вектора)
     if (processedBytes > 0)
     {
-        std::vector<uint8_t> remaining(sessionData.buffer.begin() + processedBytes, sessionData.buffer.end());
-        sessionData.buffer = std::move(remaining);
+        sessionData.buffer.erase(sessionData.buffer.begin(), sessionData.buffer.begin() + processedBytes);
     }
 }
 
 // Callback для обработки новых TCP данных
 void onTcpMessageReady(int8_t side, const TcpStreamData& tcpData, void* userCookie)
 {
+    AppContext* ctx = static_cast<AppContext*>(userCookie);
     const ConnectionData& connData = tcpData.getConnectionData();
     uint32_t flowKey = connData.flowKey;
     
     // Получаем или создаем запись для этой сессии
-    auto& sessionData = sessionDataMap[flowKey];
+    auto& sessionData = ctx->sessionDataMap[flowKey];
     
     if (!sessionData.isActive)
     {
         // Создаем файл для этой сессии
-        sessionData.fileName = fmt::format("websocket_session_{}_{}_{}_{}_{}.txt",
+        sessionData.fileName = fmt::format("{}_{}_{}_{}_{}_{}.txt",
+            ctx->outputFileName,
             connData.srcIP.toString(), connData.srcPort,
             connData.dstIP.toString(), connData.dstPort,
             flowKey);
+            
         sessionData.outputFile.open(sessionData.fileName, std::ios::binary | std::ios::app);
+        
+        if (!sessionData.outputFile.is_open())
+        {
+            fmt::print(stderr, "Ошибка открытия файла для записи: {}\n", sessionData.fileName);
+            // Не помечаем сессию как активную, если файл не открылся
+            return;
+        }
+        
         sessionData.flowKey = flowKey;
         sessionData.isActive = true;
         
@@ -309,10 +336,10 @@ void onTcpMessageReady(int8_t side, const TcpStreamData& tcpData, void* userCook
         timeval packetTime = tcpData.getTimeStamp();
         
         // Обрабатываем как WebSocket данные
-        processWebSocketData(flowKey, data, dataLen, packetTime);
+        processWebSocketData(sessionData, data, dataLen, packetTime);
         
         // Если есть пропущенные байты, добавляем маркер
-        if (tcpData.isBytesMissing())
+        if (tcpData.isBytesMissing() && sessionData.outputFile.is_open())
         {
             std::string missingMarker = fmt::format("\n[{} bytes missing]\n", tcpData.getMissingByteCount());
             sessionData.outputFile.write(missingMarker.c_str(), missingMarker.length());
@@ -331,17 +358,24 @@ void onTcpConnectionStart(const ConnectionData& connectionData, void* userCookie
 // Callback для окончания TCP соединения
 void onTcpConnectionEnd(const ConnectionData& connectionData, TcpReassembly::ConnectionEndReason reason, void* userCookie)
 {
+    AppContext* ctx = static_cast<AppContext*>(userCookie);
     uint32_t flowKey = connectionData.flowKey;
-    auto it = sessionDataMap.find(flowKey);
+    auto it = ctx->sessionDataMap.find(flowKey);
     
-    if (it != sessionDataMap.end())
+    if (it != ctx->sessionDataMap.end())
     {
         // Обрабатываем оставшиеся данные в буфере
         if (!it->second.buffer.empty() && (it->second.lastPacketTime.tv_sec != 0 || it->second.lastPacketTime.tv_usec != 0))
         {
             // Используем время последнего пакета для оставшихся данных
-            processWebSocketData(flowKey, it->second.buffer.data(), it->second.buffer.size(), 
-                               it->second.lastPacketTime);
+            processWebSocketData(it->second, nullptr, 0, it->second.lastPacketTime); // Вызываем с пустыми данными, чтобы допарсить буфер
+        }
+        
+        // Проверяем, остались ли нераспаршенные данные
+        if (!it->second.buffer.empty() && it->second.outputFile.is_open())
+        {
+             std::string incompleteMsg = fmt::format("\n[WARNING: Connection ended with {} bytes of incomplete frame data in buffer]\n", it->second.buffer.size());
+             it->second.outputFile.write(incompleteMsg.c_str(), incompleteMsg.length());
         }
         
         if (it->second.outputFile.is_open())
@@ -355,14 +389,29 @@ void onTcpConnectionEnd(const ConnectionData& connectionData, TcpReassembly::Con
             it->second.fileName);
         
         it->second.isActive = false;
+        // Опционально: удаляем сессию из карты для освобождения памяти
+        // ctx->sessionDataMap.erase(it);
     }
 }
 
-int main()
+int main(int argc, char* argv[])
 {
-    const std::string pcapFileName = "capture/capture2.htm";
+    // Проверяем аргументы командной строки
+    if (argc < 3)
+    {
+        fmt::print(stderr, "Использование: {} <путь_к_pcap_файлу> <имя_выходного_файла>\n", argv[0]);
+        fmt::print(stderr, "Пример: {} capture/capture2.pcap output.txt\n", argv[0]);
+        return 1;
+    }
+    
+    const std::string pcapFileName = argv[1];
+    
+    // Инициализируем контекст приложения
+    AppContext ctx;
+    ctx.outputFileName = argv[2];
     
     fmt::print("Чтение pcap файла: {}\n", pcapFileName);
+    fmt::print("Выходной файл: {}\n", ctx.outputFileName);
     
     // Пробуем открыть как pcap файл
     IFileReaderDevice* reader = nullptr;
@@ -396,8 +445,8 @@ int main()
     
     fmt::print("Файл успешно открыт\n");
     
-    // Создаем TcpReassembly с нашими callbacks
-    TcpReassembly tcpReassembly(onTcpMessageReady, nullptr, onTcpConnectionStart, onTcpConnectionEnd);
+    // Создаем TcpReassembly с нашими callbacks и передаем контекст
+    TcpReassembly tcpReassembly(onTcpMessageReady, &ctx, onTcpConnectionStart, onTcpConnectionEnd);
     
     RawPacket rawPacket;
     int packetCount = 0;
@@ -414,7 +463,7 @@ int main()
         TcpReassembly::ReassemblyStatus status = tcpReassembly.reassemblePacket(parsedPacket);
         
         // Выводим информацию о статусе (опционально, для отладки)
-        if (packetCount % 100 == 0)
+        if (packetCount % 10000 == 0)
         {
             fmt::print("Обработано пакетов: {}\n", packetCount);
         }
@@ -425,8 +474,8 @@ int main()
     // Закрываем все открытые соединения
     tcpReassembly.closeAllConnections();
     
-    // Закрываем все файлы
-    for (auto& pair : sessionDataMap)
+    // Закрываем все файлы (на всякий случай, хотя closeAllConnections вызовет onTcpConnectionEnd)
+    for (auto& pair : ctx.sessionDataMap)
     {
         if (pair.second.outputFile.is_open())
         {
@@ -439,7 +488,7 @@ int main()
     pcapReader.reset();
     pcapngReader.reset();
     
-    fmt::print("Обработка завершена. Создано WebSocket сессий: {}\n", sessionDataMap.size());
+    fmt::print("Обработка завершена. Создано WebSocket сессий: {}\n", ctx.sessionDataMap.size());
     
     return 0;
 }
